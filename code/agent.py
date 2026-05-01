@@ -25,6 +25,7 @@ if not API_KEY:
 # Initialize the new Client
 client = genai.Client(api_key=API_KEY)
 MODEL_NAME = "gemini-2.5-flash"
+FALLBACK_MODEL = "gemini-2.5-pro"
 
 # Define safety settings using the new types
 SAFETY_SETTINGS = [
@@ -96,8 +97,8 @@ class OrchestrateAgent:
         top_indices = sorted(scored_chunks, key=scored_chunks.get, reverse=True)[:top_k]
         return [self.corpus[i] for i in top_indices]
 
-    def call_gemini(self, prompt: str, schema: BaseModel, system_instruction: str, max_retries: int = 3) -> dict:
-        """Wrapper for the new google-genai client with aggressive 429 backoff."""
+    def call_gemini(self, prompt: str, schema: BaseModel, system_instruction: str, max_retries: int = 2) -> dict:
+        """Wrapper with 429 backoff and automatic model fallback."""
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
@@ -106,22 +107,28 @@ class OrchestrateAgent:
             safety_settings=SAFETY_SETTINGS
         )
         
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model=MODEL_NAME,
-                    contents=prompt,
-                    config=config
-                )
-                return json.loads(response.text)
-            except Exception as e:
-                if '429' in str(e):
-                    print(f"Rate limit hit. Sleeping 60s... (Attempt {attempt + 1}/{max_retries})")
-                    time.sleep(60)
-                else:
-                    print(f"Generation error: {e}")
-                    raise e
-        raise Exception("Max retries exceeded for Gemini API.")
+        models_to_try = [MODEL_NAME, FALLBACK_MODEL]
+        
+        for current_model in models_to_try:
+            for attempt in range(max_retries):
+                try:
+                    response = client.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=config
+                    )
+                    return json.loads(response.text)
+                except Exception as e:
+                    if '429' in str(e) or 'quota' in str(e).lower():
+                        print(f"[{current_model}] Rate limit/Quota hit. Sleeping 20s... (Attempt {attempt + 1}/{max_retries})")
+                        time.sleep(20)
+                    else:
+                        print(f"[{current_model}] Generation error: {e}")
+                        break # If it's a structural error, don't sleep, just move to fallback
+            
+            print(f"⚠️ Exhausted {current_model}. Switching to fallback...")
+            
+        raise Exception("FATAL: Max retries exceeded for both Flash and Pro models. Swap API keys.")
 
     def process_row(self, row) -> dict:
         # FIX: Ensure column extraction is completely case-insensitive and safe against Pandas NaNs
@@ -215,6 +222,7 @@ def main():
         print(f"Processing row {index + 1}/{len(df)}...")
         out_dict = agent.process_row(row)
         results.append(out_dict)
+        time.sleep(4)
         
     out_df = pd.DataFrame(results)
     out_df.to_csv(args.output, index=False)
