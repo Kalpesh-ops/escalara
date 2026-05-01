@@ -1,0 +1,7 @@
+sentence-transformers
+rank_bm25
+numpy
+google-genai
+python-dotenv
+pandas
+pydantic
