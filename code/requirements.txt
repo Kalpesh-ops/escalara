@@ -1,7 +1,7 @@
 sentence-transformers
 rank_bm25
 numpy
-google-genai
+openai
 python-dotenv
 pandas
 pydantic

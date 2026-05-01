@@ -9,43 +9,27 @@ from pydantic import BaseModel, Field
 from rank_bm25 import BM25Okapi
 from dotenv import load_dotenv
 
-# Modern Google GenAI SDK
-from google import genai
-from google.genai import types
+# NEW: Universal OpenAI Client
+from openai import OpenAI
 
-# Load .env file if it exists
+# Load .env file
 load_dotenv()
 
-# 1. Setup API and Models
-API_KEY = os.environ.get("GEMINI_API_KEY")
+API_KEY = os.environ.get("OPENROUTER_API_KEY")
 if not API_KEY:
-    print("FATAL: GEMINI_API_KEY environment variable not set. Please set it in your .env file or terminal.")
+    print("FATAL: OPENROUTER_API_KEY environment variable not set in .env.")
     sys.exit(1)
 
-# Initialize the new Client
-client = genai.Client(api_key=API_KEY)
-MODEL_NAME = "gemini-2.5-flash"
-FALLBACK_MODEL = "gemini-2.5-pro"
+# Initialize OpenAI client pointing to OpenRouter
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=API_KEY,
+)
 
-# Define safety settings using the new types
-SAFETY_SETTINGS = [
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-    types.SafetySetting(
-        category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-        threshold=types.HarmBlockThreshold.BLOCK_NONE,
-    ),
-]
+# Primary and Fallback Models on OpenRouter
+MODEL_NAME = "meta-llama/llama-3.3-70b-instruct" # Incredibly fast, great at JSON
+FALLBACK_MODEL = "anthropic/claude-3-haiku"       # Cheap, reliable fallback
+
 
 # 2. Pydantic Schemas for Structured Output
 class TriageOutput(BaseModel):
@@ -97,38 +81,43 @@ class OrchestrateAgent:
         top_indices = sorted(scored_chunks, key=scored_chunks.get, reverse=True)[:top_k]
         return [self.corpus[i] for i in top_indices]
 
-    def call_gemini(self, prompt: str, schema: BaseModel, system_instruction: str, max_retries: int = 2) -> dict:
-        """Wrapper with 429 backoff and automatic model fallback."""
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            response_mime_type="application/json",
-            response_schema=schema,
-            temperature=0.0,
-            safety_settings=SAFETY_SETTINGS
-        )
+    def call_llm(self, prompt: str, schema: BaseModel, system_instruction: str, max_retries: int = 2) -> dict:
+        """Universal LLM wrapper using OpenRouter."""
+        
+        # Inject the Pydantic schema into the system prompt to guarantee JSON structure
+        schema_json = json.dumps(schema.model_json_schema(), indent=2)
+        system_with_schema = f"{system_instruction}\n\nYou MUST return ONLY raw, valid JSON matching this schema. Do not use markdown blocks:\n{schema_json}"
         
         models_to_try = [MODEL_NAME, FALLBACK_MODEL]
         
         for current_model in models_to_try:
             for attempt in range(max_retries):
                 try:
-                    response = client.models.generate_content(
+                    response = client.chat.completions.create(
                         model=current_model,
-                        contents=prompt,
-                        config=config
+                        messages=[
+                            {"role": "system", "content": system_with_schema},
+                            {"role": "user", "content": prompt}
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.0
                     )
-                    return json.loads(response.text)
+                    
+                    # Parse the string response into a dict
+                    result_text = response.choices[0].message.content
+                    return json.loads(result_text)
+                    
                 except Exception as e:
-                    if '429' in str(e) or 'quota' in str(e).lower():
-                        print(f"[{current_model}] Rate limit/Quota hit. Sleeping 20s... (Attempt {attempt + 1}/{max_retries})")
-                        time.sleep(20)
+                    if '429' in str(e):
+                        print(f"[{current_model}] Rate limit hit. Sleeping 10s... (Attempt {attempt + 1}/{max_retries})")
+                        time.sleep(10)
                     else:
                         print(f"[{current_model}] Generation error: {e}")
-                        break # If it's a structural error, don't sleep, just move to fallback
+                        break # Move to fallback model if it's a structural 500/503 error
             
             print(f"⚠️ Exhausted {current_model}. Switching to fallback...")
             
-        raise Exception("FATAL: Max retries exceeded for both Flash and Pro models. Swap API keys.")
+        raise Exception("FATAL: Max retries exceeded for all models.")
 
     def process_row(self, row) -> dict:
         # FIX: Ensure column extraction is completely case-insensitive and safe against Pandas NaNs
@@ -148,7 +137,7 @@ class OrchestrateAgent:
         triage_system = "You are a strict support triage router. Output valid JSON."
         
         try:
-            triage_data = self.call_gemini(triage_prompt, TriageOutput, triage_system)
+            triage_data = self.call_llm(triage_prompt, TriageOutput, triage_system)
         except Exception as e:
             print(f"Pass 1 Triage Failed: {e}")
             triage_data = {"inferred_company": company, "request_type": "invalid", "search_queries": [issue[:100]]}
@@ -184,7 +173,7 @@ class OrchestrateAgent:
         final_system = "You are a support agent. You must ONLY use the provided chunks to answer. If the answer is not in the chunks, or if the issue involves fraud, unauthorized access, or legal threats, you MUST escalate."
         
         try:
-            final_data = self.call_gemini(final_prompt, FinalResponseOutput, final_system)
+            final_data = self.call_llm(final_prompt, FinalResponseOutput, final_system)
         except Exception as e:
             print(f"Pass 2 Generation Failed: {e}")
             final_data = {
