@@ -124,9 +124,17 @@ class OrchestrateAgent:
         raise Exception("Max retries exceeded for Gemini API.")
 
     def process_row(self, row) -> dict:
-        issue = str(row.get('issue', ''))
-        subject = str(row.get('subject', ''))
-        company = str(row.get('company', 'None'))
+        # FIX: Ensure column extraction is completely case-insensitive and safe against Pandas NaNs
+        row_dict = {str(k).lower(): v for k, v in row.items()}
+        
+        issue_raw = row_dict.get('issue', '')
+        issue = "" if pd.isna(issue_raw) else str(issue_raw)
+        
+        subject_raw = row_dict.get('subject', '')
+        subject = "" if pd.isna(subject_raw) else str(subject_raw)
+        
+        company_raw = row_dict.get('company', 'None')
+        company = "None" if pd.isna(company_raw) else str(company_raw)
         
         # --- PASS 1: TRIAGE ---
         triage_prompt = f"Issue: {issue}\nSubject: {subject}\nCompany (if known): {company}\nAnalyze this ticket and generate the required JSON."
@@ -134,8 +142,8 @@ class OrchestrateAgent:
         
         try:
             triage_data = self.call_gemini(triage_prompt, TriageOutput, triage_system)
-        except Exception:
-            # Fallback on total failure
+        except Exception as e:
+            print(f"Pass 1 Triage Failed: {e}")
             triage_data = {"inferred_company": company, "request_type": "invalid", "search_queries": [issue[:100]]}
 
         # Handle explicit injection/invalid strings
@@ -170,7 +178,8 @@ class OrchestrateAgent:
         
         try:
             final_data = self.call_gemini(final_prompt, FinalResponseOutput, final_system)
-        except Exception:
+        except Exception as e:
+            print(f"Pass 2 Generation Failed: {e}")
             final_data = {
                 "status": "escalated",
                 "product_area": "Unknown",
@@ -183,8 +192,9 @@ class OrchestrateAgent:
 
 def main():
     parser = argparse.ArgumentParser(description="Escalara Support Agent")
+    # Updated default paths per your setup
     parser.add_argument("--input", type=str, default="support_tickets/sample_support_tickets.csv", help="Path to input CSV")
-    parser.add_argument("--output", type=str, default="support_tickets/output.csv", help="Path to save output CSV")
+    parser.add_argument("--output", type=str, default="support_tickets/sample_output.csv", help="Path to save output CSV")
     args = parser.parse_args()
 
     # Ensure corpus is loaded from the directory where this script lives
